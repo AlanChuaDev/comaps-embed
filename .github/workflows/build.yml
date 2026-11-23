@@ -93,6 +93,20 @@ jobs:
             java -jar apktool.jar b decoded -o unsigned.apk
           fi
 
+      - name: Dump activity declarations (diagnostics)
+        if: steps.exists.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee activities.txt
+          import re
+          s = open("decoded/AndroidManifest.xml", encoding="utf-8").read()
+          print("--- <application> tag ---")
+          print(re.search(r"<application\b[^>]*>", s, re.S).group(0))
+          print("--- <activity> tags ---")
+          for m in re.finditer(r"<activity\b[^>]*>", s, re.S):
+              print(re.sub(r"\s+", " ", m.group(0)))
+          PY
+
       - name: Align and sign
         if: steps.exists.outputs.skip == 'false'
         env:
@@ -122,7 +136,7 @@ jobs:
           cp final.apk "CoMaps-embed-${TAG}.apk"
           {
             echo "Upstream CoMaps ${TAG}, repackaged with allowUntrustedActivityEmbedding."
-            echo; echo '```'; cat badging.txt; echo; cat patch.log; echo '```'
+            echo; echo '```'; cat badging.txt; echo; cat patch.log; echo; cat activities.txt; echo '```'
             echo; echo "Signed with this repo's key, NOT the official one: uninstall the official app first."
           } > notes.md
           gh release delete "${TAG}-embed" --yes --cleanup-tag 2>/dev/null || true
