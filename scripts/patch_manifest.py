@@ -32,6 +32,17 @@ s = re.sub(r'android:screenOrientation="' + portrait + '"',
            'android:screenOrientation="unspecified"', s)
 print(f"portrait-forced screenOrientation fixed: {len(hits)}")
 
+# 3b) singleTask / singleInstance activities open in their OWN task, so they cannot be
+#     placed beside the host. Switch them to singleTop (only real <activity>, not aliases).
+def _fix_launch_mode(m):
+    t = m.group(0)
+    if re.search(r'android:launchMode="(singleTask|singleInstance|singleInstancePerTask)"', t):
+        name = re.search(r'android:name="([^"]*)"', t)
+        print("launchMode -> singleTop:", name.group(1) if name else "?")
+        t = re.sub(r'android:launchMode="[^"]*"', 'android:launchMode="singleTop"', t)
+    return t
+s = re.sub(r"<activity\b[^>]*>", _fix_launch_mode, s, flags=re.S)
+
 # 4) things that can break split-screen: just report
 for pat in (r'android:maxAspectRatio="[^"]*"', r'android:minAspectRatio="[^"]*"',
             r'android:screenOrientation="[^"]*"', r'android:resizeableActivity="[^"]*"',
