@@ -2,7 +2,7 @@ name: Build embeddable CoMaps
 
 on:
   schedule:
-    - cron: "17 3 * * *"        # daily check for a new upstream release
+    - cron: "17 3 * * *"
   workflow_dispatch:
     inputs:
       force:
@@ -14,9 +14,9 @@ permissions:
   contents: write
 
 env:
-  APKTOOL_VERSION: "2.11.1"
-  # Official CoMaps release signing cert (from github.com/comaps/comaps README)
+  # Official CoMaps release signing cert (from the comaps README)
   UPSTREAM_SHA256: "4894e8e6963627ef660031d8593fe77297f835acb4e23810003e926135023b4c"
+  GH_TOKEN: ${{ github.token }}
 
 jobs:
   build:
@@ -37,20 +37,17 @@ jobs:
           tag=$(jq -r .tag_name <<<"$json")
           echo "Upstream tag: $tag"
           echo "Assets:"; jq -r '.assets[].name' <<<"$json"
-          # Prefer the universal release APK; skip F-Droid/debug/test builds.
           url=$(jq -r '[.assets[] | select(.name|endswith(".apk"))
                  | select(.name|test("release";"i"))
                  | select(.name|test("fdroid|debug|test";"i")|not)][0].browser_download_url // empty' <<<"$json")
           if [ -z "$url" ]; then
             echo "::error::No suitable .apk asset found. Adjust the filter above."; exit 1
           fi
-          echo "tag=$tag"  >> "$GITHUB_OUTPUT"
-          echo "url=$url"  >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
 
       - name: Skip if already released
         id: exists
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           if gh release view "${{ steps.up.outputs.tag }}-embed" >/dev/null 2>&1 \
              && [ "${{ inputs.force }}" != "true" ]; then
@@ -59,53 +56,26 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Set up tools
-        if: steps.exists.outputs.skip == 'false'
-        run: |
-          set -euo pipefail
-          BT=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)
-          echo "BT=$ANDROID_HOME/build-tools/$BT" >> "$GITHUB_ENV"
-          curl -fsSL -o apktool.jar \
-            "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar"
-
       - name: Download and verify upstream APK
         if: steps.exists.outputs.skip == 'false'
         run: |
           set -euo pipefail
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n1)
+          echo "BT=$BT" >> "$GITHUB_ENV"
           curl -fsSL -o upstream.apk "${{ steps.up.outputs.url }}"
           "$BT/apksigner" verify --print-certs upstream.apk | tee certs.txt
           got=$(grep -i 'certificate SHA-256 digest' certs.txt | head -1 | awk '{print $NF}' | tr 'A-F' 'a-f')
           if [ "$got" != "$UPSTREAM_SHA256" ]; then
             echo "::error::Upstream signature mismatch ($got). Refusing to repackage."; exit 1
           fi
-          "$BT/aapt2" dump badging upstream.apk | grep -E "^(package|launchable-activity|sdkVersion|targetSdkVersion)" | tee badging.txt
 
-      - name: Decode, patch, rebuild
+      - name: Patch manifest directly (no apktool)
         if: steps.exists.outputs.skip == 'false'
         run: |
           set -euo pipefail
-          java -jar apktool.jar d -f upstream.apk -o decoded
-          python3 scripts/patch_manifest.py decoded | tee patch.log
-          if ! java -jar apktool.jar b decoded -o unsigned.apk; then
-            echo "::warning::Build failed; retrying with SDK android.jar as framework"
-            PLAT=$(ls -d "$ANDROID_HOME"/platforms/android-* | sort -V | tail -1)
-            java -jar apktool.jar if "$PLAT/android.jar"
-            java -jar apktool.jar b decoded -o unsigned.apk
-          fi
-
-      - name: Dump activity declarations (diagnostics)
-        if: steps.exists.outputs.skip == 'false'
-        run: |
-          set -euo pipefail
-          python3 - <<'PY' | tee activities.txt
-          import re
-          s = open("decoded/AndroidManifest.xml", encoding="utf-8").read()
-          print("--- <application> tag ---")
-          print(re.search(r"<application\b[^>]*>", s, re.S).group(0))
-          print("--- <activity> tags ---")
-          for m in re.finditer(r"<activity\b[^>]*>", s, re.S):
-              print(re.sub(r"\s+", " ", m.group(0)))
-          PY
+          JAR="$(ls -d "$ANDROID_HOME"/platforms/android-[0-9]* | sort -V | tail -n1)/android.jar"
+          echo "android.jar: $JAR"
+          python3 -I scripts/patch_apk.py upstream.apk unsigned.apk report.json "$JAR"
 
       - name: Align and sign
         if: steps.exists.outputs.skip == 'false'
@@ -123,21 +93,28 @@ jobs:
             --ks-key-alias "$KEY_ALIAS" --out final.apk aligned.apk
           rm -f "$RUNNER_TEMP/release.jks"
           "$BT/apksigner" verify --print-certs final.apk
-          # Prove the attribute really made it into the binary manifest
-          "$BT/aapt2" dump xmltree --file AndroidManifest.xml final.apk | grep -i allowUntrustedActivityEmbedding
+
+      - name: Verify result
+        if: steps.exists.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          "$BT/aapt2" dump xmltree --file AndroidManifest.xml final.apk > tree.txt
+          grep -c 'allowUntrustedActivityEmbedding' tree.txt
+          grep -q 'allowUntrustedActivityEmbedding' tree.txt
+          "$BT/aapt2" dump badging final.apk | grep -E "^package:|^targetSdkVersion|launchable-activity" | tee badging.txt
+          grep -E 'launchMode|allowUntrustedActivityEmbedding' tree.txt | tee flags.txt
 
       - name: Publish release
         if: steps.exists.outputs.skip == 'false'
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           TAG="${{ steps.up.outputs.tag }}"
           cp final.apk "CoMaps-embed-${TAG}.apk"
           {
-            echo "Upstream CoMaps ${TAG}, repackaged with allowUntrustedActivityEmbedding."
-            echo; echo '```'; cat badging.txt; echo; cat patch.log; echo; cat activities.txt; echo '```'
-            echo; echo "Signed with this repo's key, NOT the official one: uninstall the official app first."
+            echo "Upstream CoMaps ${TAG}, repackaged (binary manifest edit, no apktool)."
+            echo; echo '```json'; cat report.json; echo '```'
+            echo; echo '```'; cat badging.txt; echo; cat flags.txt; echo '```'
+            echo; echo "Signed with this repo's key, NOT the official one."
           } > notes.md
           gh release delete "${TAG}-embed" --yes --cleanup-tag 2>/dev/null || true
           gh release create "${TAG}-embed" "CoMaps-embed-${TAG}.apk" \
